@@ -98,6 +98,77 @@
 
 **安全卸载。** 退出游戏后点击 **卸载补丁**，仅清理已确认属于该部署的文件，保留原游戏文件、未知文件和其他 MOD。文件被占用时会提示重试，关闭相关程序后再操作。从游戏库移除条目不等于卸载补丁；**清理缓存** 不会删除游戏库与偏好。
 
+## Linux：Wine 前缀支持
+
+Linux 版 AppImage 构建，面向 Wine 前缀而非真实 Windows 系统。请照常在
+前缀中安装游戏，再指定前缀：界面选择、`RTXFG_PREFIX`、`WINEPREFIX`，或默认的
+`~/.wine`。
+
+可用：扫描 `<prefix>/drive_c`，安装、替换、卸载补丁 DLL，每游戏设置、预设、
+五种界面语言与 38 套主题。依赖注册表的功能直接编辑前缀的 `system.reg` 与
+`user.reg`，包括显卡显示名称功能。
+
+不可用，且会明确提示而不是静默失败：发布者数字签名验证（更新文件仍校验文件
+大小与 SHA-256，但 Windows 发布者身份无法在非 Windows 环境下证明）、管理员
+提权、HAGS（硬件加速 GPU 计划）、Windows 错误事件日志、`ms-settings:` 链接。
+运行时需要可用的 Vulkan 驱动，即 `mesa-vulkan-drivers`，或作为软件回退的
+`lavapipe`。AppImage 不捆绑任何显卡驱动。
+
+## 从源码构建
+
+两个平台都需要 Rustup。Windows 的前置条件、可选测试开关等完整内容见
+[构建说明](BUILDING.md)。
+
+### Windows
+
+```powershell
+./tools/prepare-build.ps1
+cargo check --locked
+cargo build --locked --release
+```
+
+产物：`target/x86_64-pc-windows-msvc/release/RTXManager.exe`。
+`prepare-build.ps1` 会下载固定的 aria2 二进制，因此需要联网一次。
+
+### Linux
+
+`.cargo/config.toml` 锁定了 Windows 目标以保证该构建可复现，所以 Linux 下
+每条命令都必须显式带 `--target`：
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+cargo test   --locked --target x86_64-unknown-linux-gnu
+cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+cargo build  --locked --release --target x86_64-unknown-linux-gnu
+```
+
+产物：`target/x86_64-unknown-linux-gnu/release/RTXManager`。
+
+编译与打包所需的发行版软件包：
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y --no-install-recommends \
+  build-essential pkg-config ca-certificates curl wget file \
+  libfreetype-dev libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libxcb1-dev libxcb-xkb-dev libwayland-dev squashfs-tools desktop-file-utils zsync
+
+# Arch / CachyOS
+sudo pacman -S --needed base-devel pkgconf curl wget file \
+  freetype2 fontconfig libxkbcommon libxcb wayland squashfs-tools desktop-file-utils zsync
+```
+
+生成 AppImage 需要先取得 `appimagetool`，再运行打包脚本：
+
+```bash
+curl -fL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimagetool
+APPIMAGETOOL=$PWD/appimagetool packaging/build-appimage.sh
+```
+
+产物为 `dist/RTXManager-<version>-x86_64.AppImage`。运行它需要 FUSE，通常是
+`libfuse2`（Ubuntu 24.04 及以上为 `libfuse2t64`）。
+
 ## 常见问题与限制
 
 - **扫描到游戏不等于确认兼容。** 可用性取决于游戏的帧生成接入、图形接口、驱动和显卡。请求倍率不代表同等倍数的 FPS 提升，也不保证延迟不变；本项目不承诺性能收益。

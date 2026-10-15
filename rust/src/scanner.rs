@@ -370,7 +370,7 @@ pub struct Evidence {
 }
 /// Bounded, read-only component discovery, called only in a background worker.
 pub fn inspect(exe: &Path) -> Evidence {
-    use std::os::windows::fs::MetadataExt;
+    use crate::platform::MetadataExt;
     let mut result = Evidence::default();
     let Ok(root) = core::no_links(&game_root(exe)) else {
         result.limited = true;

@@ -90,7 +90,7 @@ pub fn within(p: &Path, root: &Path) -> bool {
     p == r || p.starts_with(&(r + "\\"))
 }
 pub fn is_link(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
+    use crate::platform::MetadataExt;
     meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
 }
 pub fn no_links(path: &Path) -> Result<PathBuf> {

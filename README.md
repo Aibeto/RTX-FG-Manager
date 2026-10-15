@@ -97,6 +97,80 @@ The scheme name indicates its origin, not the download route. **Project source**
 
 **Safe removal.** Exit the game and use **Uninstall patch**. The manager removes recognized files belonging to that deployment while preserving original game files, unknown files and other mods. Locked files leave a retry notice; close the relevant processes and retry. Removing a game from the library is not uninstalling its patch, and **Clear cache** does not delete the library or preferences.
 
+## Linux: Wine prefix support
+
+Linux builds ship as an AppImage and work on a Wine prefix instead of a live
+Windows install. Install a game in the prefix as usual, then point the manager
+at it. It takes the prefix from the UI, or from `RTXFG_PREFIX`, or `WINEPREFIX`,
+or `~/.wine`.
+
+What works: scanning `<prefix>/drive_c`, installing, replacing and removing
+patched DLLs, per-game settings, presets, the five UI languages and 38 themes.
+Registry-backed features edit the prefix's `system.reg` and `user.reg` directly,
+including the GPU display-name feature.
+
+What does not work, and says so instead of failing quietly: publisher signature
+verification (update files are still checked by size and SHA-256, but a Windows
+publisher identity cannot be proven outside Windows), administrator elevation,
+HAGS, the Windows error event log, and `ms-settings:` links. A working Vulkan
+driver is required, either `mesa-vulkan-drivers` or `lavapipe` as a software
+fallback. The AppImage bundles no GPU driver.
+
+## Build from source
+
+Both builds need Rustup. Full details, including the Windows prerequisites and
+the optional test features, are in [BUILDING.md](BUILDING.md).
+
+### Windows
+
+```powershell
+./tools/prepare-build.ps1
+cargo check --locked
+cargo build --locked --release
+```
+
+Output: `target/x86_64-pc-windows-msvc/release/RTXManager.exe`. `prepare-build.ps1`
+fetches the pinned aria2 binary, so the network is needed once.
+
+### Linux
+
+`.cargo/config.toml` pins the Windows target to keep that build reproducible,
+so every Linux command must pass `--target` explicitly:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu
+cargo test   --locked --target x86_64-unknown-linux-gnu
+cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+cargo build  --locked --release --target x86_64-unknown-linux-gnu
+```
+
+Output: `target/x86_64-unknown-linux-gnu/release/RTXManager`.
+
+Distribution packages needed to compile and package:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y --no-install-recommends \
+  build-essential pkg-config ca-certificates curl wget file \
+  libfreetype-dev libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libxcb1-dev libxcb-xkb-dev libwayland-dev squashfs-tools desktop-file-utils zsync
+
+# Arch / CachyOS
+sudo pacman -S --needed base-devel pkgconf curl wget file \
+  freetype2 fontconfig libxkbcommon libxcb wayland squashfs-tools desktop-file-utils zsync
+```
+
+To produce the AppImage, get `appimagetool` and run the packaging script:
+
+```bash
+curl -fL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimagetool
+APPIMAGETOOL=$PWD/appimagetool packaging/build-appimage.sh
+```
+
+That writes `dist/RTXManager-<version>-x86_64.AppImage`. Running it needs FUSE,
+most often `libfuse2` (`libfuse2t64` on Ubuntu 24.04 and newer).
+
 ## FAQ and limits
 
 - **A scanned game is not a compatibility verdict.** Results depend on its frame-generation integration, graphics API, driver and GPU. A requested multiplier does not guarantee the same FPS increase or unchanged latency; no performance gain is promised.

@@ -1,4 +1,8 @@
 //! Isolated filesystem regressions. The synthetic PE files are never executed.
+// These regressions exercise Win32 share modes and handles directly, so the
+// whole test binary is Windows-only. It compiles to nothing on other targets.
+#![cfg(windows)]
+
 use anyhow::Result;
 use rtx_fg_manager::{cleanup, core, diagnostics, presets};
 use std::{

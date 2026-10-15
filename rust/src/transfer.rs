@@ -5,15 +5,15 @@
 //! every redirect it observes, but cannot bind a later server response to that
 //! response. Hashes/signatures remain mandatory for executable payloads; HTTPS
 //! certificate verification is never disabled.
+#[cfg(windows)]
+use crate::platform::CommandExt;
 use crate::{assets, core};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
-    os::windows::process::CommandExt,
+    io::Read,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -238,9 +238,9 @@ impl Failure {
     }
 }
 
-fn checked_response(error: reqwest::Error) -> anyhow::Error {
+fn checked_response(error: &reqwest::Error) -> anyhow::Error {
     let mut certificate_error = false;
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = cause {
         let text = current.to_string().to_ascii_lowercase();
         certificate_error |= text.contains("certificate") || text.contains("unknownissuer");
@@ -263,6 +263,24 @@ fn checked_response(error: reqwest::Error) -> anyhow::Error {
         Failure::Connection
     };
     failure.into()
+}
+
+/// Maps a body-read failure onto a `Failure`. `reqwest` decodes its own errors
+/// (including its timeout) into `io::Error`, so the cause is recovered from the
+/// chain before falling back to a generic connection error.
+#[cfg(not(windows))]
+fn checked_read(error: std::io::Error) -> anyhow::Error {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if let Some(inner) = current.downcast_ref::<reqwest::Error>() {
+            return checked_response(inner);
+        }
+        cause = current.source();
+    }
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return Failure::Timeout.into();
+    }
+    Failure::Connection.into()
 }
 
 impl std::fmt::Display for Failure {
@@ -299,22 +317,29 @@ fn preflight(url: &str, policy: UrlPolicy, cancel: &AtomicBool) -> Result<reqwes
     let mut response = client
         .head(initial.clone())
         .send()
-        .map_err(checked_response)?;
+        .map_err(|e| checked_response(&e))?;
     // Gitee's public release API returns 401 to HEAD but allows anonymous GET.
     // Some public CDNs likewise reject HEAD. No credentials are added. Do
     // not consume its body; aria2 receives the final checked URL below.
     if matches!(response.status().as_u16(), 401 | 403 | 405 | 501) {
-        response = client.get(initial).send().map_err(checked_response)?;
+        response = client
+            .get(initial)
+            .send()
+            .map_err(|e| checked_response(&e))?;
     }
     check_cancel(cancel)?;
-    let response = response.error_for_status().map_err(checked_response)?;
+    let response = response
+        .error_for_status()
+        .map_err(|e| checked_response(&e))?;
     validate_url(response.url().as_str(), policy)
 }
 
+#[cfg(windows)]
 pub(crate) struct Readout {
     file: fs::File,
     pending: Vec<u8>,
 }
+#[cfg(windows)]
 impl Readout {
     pub(crate) fn new(path: &Path) -> Result<Self> {
         let mut file = fs::File::open(path)?;
@@ -351,7 +376,9 @@ impl Readout {
     }
 }
 
+#[cfg(windows)]
 struct DownloadChild(Child);
+#[cfg(windows)]
 impl Drop for DownloadChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
@@ -414,135 +441,254 @@ fn attempt(
     };
     progress(status.clone());
     let url = preflight(&source.url, request.policy, cancel)?;
-    check_cancel(cancel)?;
-    ensure!(Instant::now() < deadline, Failure::Timeout);
-    let tool = assets::tool()?;
-    let parent = path.parent().context("下载目录无效")?;
-    let mut log = tempfile::NamedTempFile::new_in(parent)?;
-    let mut readout = Readout::new(log.path())?;
-    let mut command = Command::new(tool.clone());
-    command
-        .args(crate::updater::aria_options(&fs::read_to_string(
-            tool.with_file_name("aria2.conf"),
-        )?))
-        .args([
-            "--no-conf=true",
-            "--enable-rpc=false",
-            "--enable-dht=false",
-            "--enable-dht6=false",
-            "--enable-peer-exchange=false",
-            "--follow-torrent=false",
-            "--follow-metalink=false",
-            "--check-certificate=true",
-            "--allow-overwrite=false",
-            "--auto-file-renaming=false",
-            "--continue=true",
-            "--file-allocation=none",
-            "--connect-timeout=8",
-            "--timeout=15",
-            "--max-tries=1",
-            "--retry-wait=1",
-            "--summary-interval=1",
-            "--show-console-readout=true",
-            "--human-readable=false",
-            "--enable-color=false",
-            "--auto-save-interval=1",
-            "--no-netrc=true",
-            "--console-log-level=warn",
-            "--download-result=hide",
-        ]);
-    if sequential || request.metadata {
-        command.args([
-            "--split=1",
-            "--max-connection-per-server=1",
-            "--continue=false",
-        ]);
-    }
-    if let Some(hash) = &request.sha256 {
-        command.arg(format!("--checksum=sha-256={hash}"));
-    }
-    // process::exit / Windows termination may end worker threads without
-    // unwinding Drop. The downloader also watches this manager's PID so it
-    // cannot remain as an orphan after the application exits unexpectedly.
-    command.arg(format!("--stop-with-process={}", std::process::id()));
-    let mut child = DownloadChild(
-        command
-            .arg(format!("--dir={}", parent.display()))
-            .arg(format!(
-                "--out={}",
-                path.file_name()
-                    .context("下载文件名无效")?
-                    .to_string_lossy()
-            ))
-            .arg(url.as_str())
-            .stdin(Stdio::null())
-            .stdout(log.as_file().try_clone()?)
-            .stderr(log.as_file().try_clone()?)
-            .creation_flags(0x08000000)
-            .spawn()?,
-    );
-    let started = Instant::now();
-    let mut last_sample = started;
-    let mut sample_window = (started, 0u64);
-    let outcome = loop {
+    #[cfg(not(windows))]
+    return builtin_attempt(request, path, &url, &mut status, cancel, progress, deadline);
+    #[cfg(windows)]
+    {
         check_cancel(cancel)?;
         ensure!(Instant::now() < deadline, Failure::Timeout);
-        if let Ok(meta) = fs::metadata(path) {
-            ensure!(
-                meta.len() <= request.limit && request.bytes.is_none_or(|n| meta.len() <= n),
-                Failure::Size
+        let tool = assets::tool()?;
+        let parent = path.parent().context("下载目录无效")?;
+        let mut log = tempfile::NamedTempFile::new_in(parent)?;
+        let mut readout = Readout::new(log.path())?;
+        let mut command = Command::new(tool.clone());
+        command
+            .args(crate::updater::aria_options(&fs::read_to_string(
+                assets::tool_conf(&tool),
+            )?))
+            .args([
+                "--no-conf=true",
+                "--enable-rpc=false",
+                "--enable-dht=false",
+                "--enable-dht6=false",
+                "--enable-peer-exchange=false",
+                "--follow-torrent=false",
+                "--follow-metalink=false",
+                "--check-certificate=true",
+                "--allow-overwrite=false",
+                "--auto-file-renaming=false",
+                "--continue=true",
+                "--file-allocation=none",
+                "--connect-timeout=8",
+                "--timeout=15",
+                "--max-tries=1",
+                "--retry-wait=1",
+                "--summary-interval=1",
+                "--show-console-readout=true",
+                "--human-readable=false",
+                "--enable-color=false",
+                "--auto-save-interval=1",
+                "--no-netrc=true",
+                "--console-log-level=warn",
+                "--download-result=hide",
+            ]);
+        if sequential || request.metadata {
+            command.args([
+                "--split=1",
+                "--max-connection-per-server=1",
+                "--continue=false",
+            ]);
+        }
+        if let Some(hash) = &request.sha256 {
+            command.arg(format!("--checksum=sha-256={hash}"));
+        }
+        // process::exit / Windows termination may end worker threads without
+        // unwinding Drop. The downloader also watches this manager's PID so it
+        // cannot remain as an orphan after the application exits unexpectedly.
+        command.arg(format!("--stop-with-process={}", std::process::id()));
+        let mut child = DownloadChild(
+            command
+                .arg(format!("--dir={}", parent.display()))
+                .arg(format!(
+                    "--out={}",
+                    path.file_name()
+                        .context("下载文件名无效")?
+                        .to_string_lossy()
+                ))
+                .arg(url.as_str())
+                .stdin(Stdio::null())
+                .stdout(log.as_file().try_clone()?)
+                .stderr(log.as_file().try_clone()?)
+                .creation_flags(0x08000000)
+                .spawn()?,
+        );
+        let started = Instant::now();
+        let mut last_sample = started;
+        let mut sample_window = (started, 0u64);
+        let outcome = loop {
+            check_cancel(cancel)?;
+            ensure!(Instant::now() < deadline, Failure::Timeout);
+            if let Ok(meta) = fs::metadata(path) {
+                ensure!(
+                    meta.len() <= request.limit && request.bytes.is_none_or(|n| meta.len() <= n),
+                    Failure::Size
+                );
+            }
+            if let Some((completed, speed, connections)) =
+                readout.poll(request.bytes.unwrap_or(0))?
+            {
+                ensure!(completed <= request.limit, Failure::Size);
+                status.completed = completed;
+                status.bytes_per_second = speed;
+                status.connections = connections;
+                status.phase = Phase::Downloading;
+                last_sample = Instant::now();
+            } else if last_sample.elapsed() > Duration::from_secs(3) {
+                status.bytes_per_second = 0;
+            }
+            progress(status.clone());
+            if let Some(exit) = child.0.try_wait()? {
+                break exit;
+            }
+            if request.metadata && started.elapsed() > Duration::from_secs(20) {
+                return Err(Failure::Timeout.into());
+            }
+            if !request.metadata && sample_window.0.elapsed() >= Duration::from_secs(30) {
+                let received = status.completed.saturating_sub(sample_window.1);
+                if status.completed < status.total
+                    && received as f64 / sample_window.0.elapsed().as_secs_f64() < 256. * 1024.
+                {
+                    return Err(Failure::Stalled.into());
+                }
+                sample_window = (Instant::now(), status.completed);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        drop(child);
+        check_cancel(cancel)?;
+        if !outcome.success() {
+            log.as_file_mut().seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            log.as_file_mut()
+                .take(1024 * 1024)
+                .read_to_end(&mut bytes)?;
+            // Never display raw downloader output: signed CDN URLs can contain tokens.
+            return Err(
+                Failure::from_aria_log(outcome.code(), &String::from_utf8_lossy(&bytes)).into(),
             );
         }
-        if let Some((completed, speed, connections)) = readout.poll(request.bytes.unwrap_or(0))? {
-            ensure!(completed <= request.limit, Failure::Size);
-            status.completed = completed;
-            status.bytes_per_second = speed;
-            status.connections = connections;
-            status.phase = Phase::Downloading;
-            last_sample = Instant::now();
-        } else if last_sample.elapsed() > Duration::from_secs(3) {
-            status.bytes_per_second = 0;
-        }
+        status.phase = Phase::Verifying;
+        status.bytes_per_second = 0;
         progress(status.clone());
-        if let Some(exit) = child.0.try_wait()? {
-            break exit;
-        }
-        if request.metadata && started.elapsed() > Duration::from_secs(20) {
-            return Err(Failure::Timeout.into());
-        }
-        if !request.metadata && sample_window.0.elapsed() >= Duration::from_secs(30) {
-            let received = status.completed.saturating_sub(sample_window.1);
-            if status.completed < status.total
-                && received as f64 / sample_window.0.elapsed().as_secs_f64() < 256. * 1024.
-            {
-                return Err(Failure::Stalled.into());
-            }
-            sample_window = (Instant::now(), status.completed);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    drop(child);
-    check_cancel(cancel)?;
-    if !outcome.success() {
-        log.as_file_mut().seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        log.as_file_mut()
-            .take(1024 * 1024)
-            .read_to_end(&mut bytes)?;
-        // Never display raw downloader output: signed CDN URLs can contain tokens.
-        return Err(
-            Failure::from_aria_log(outcome.code(), &String::from_utf8_lossy(&bytes)).into(),
-        );
+        verify_file(path, request)?;
+        check_cancel(cancel)?;
+        status.completed = fs::metadata(path)?.len();
+        status.total = status.completed;
+        status.phase = Phase::Complete;
+        progress(status);
+        Ok(())
     }
+}
+
+/// Downloads with the bundled `reqwest` client instead of an external tool.
+///
+/// Windows keeps aria2 because the build embeds a verified copy. On Linux there
+/// is no embedded downloader, and requiring a system one would break downloads
+/// outright on any machine without it, so the transfer runs in-process. The same
+/// guarantees still hold: `preflight` validated the URL and its redirects, the
+/// size cap is enforced while streaming, and `verify_file` re-checks size and
+/// SHA-256 before the file is accepted.
+#[cfg(not(windows))]
+fn builtin_attempt(
+    request: &Request,
+    path: &Path,
+    url: &reqwest::Url,
+    status: &mut Progress,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(Progress),
+    deadline: Instant,
+) -> Result<()> {
+    use std::io::Write;
+    check_cancel(cancel)?;
+    ensure!(Instant::now() < deadline, Failure::Timeout);
+    let parent = path.parent().context("下载目录无效")?;
+    // Stage beside the target and publish only after verification, so a failed
+    // or cancelled download never leaves a partial file at the real name.
+    let stage = tempfile::NamedTempFile::new_in(parent)?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(600))
+        .user_agent("RTXFGManager-transfer/1")
+        .redirect(reqwest::redirect::Policy::custom(|a| {
+            if a.previous().len() >= 8 {
+                a.error("Unsafe download redirect")
+            } else {
+                a.follow()
+            }
+        }))
+        .build()?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .map_err(|e| checked_response(&e))?
+        .error_for_status()
+        .map_err(|e| checked_response(&e))?;
+    check_cancel(cancel)?;
+    let expected = response.content_length().or(request.bytes);
+    if let Some(total) = expected {
+        status.total = total;
+    }
+    status.phase = Phase::Downloading;
+    progress(status.clone());
+
+    let mut reader = response;
+    let mut buffer = vec![0u8; 65536];
+    let mut received: u64 = 0;
+    let mut window = (Instant::now(), 0u64);
+    {
+        let mut writer = stage.as_file();
+        loop {
+            check_cancel(cancel)?;
+            ensure!(Instant::now() < deadline, Failure::Timeout);
+            let n = reader.read(&mut buffer).map_err(checked_read)?;
+            if n == 0 {
+                break;
+            }
+            // Enforce the cap while streaming, so an oversized response cannot
+            // fill the disk before it is rejected.
+            received = received.saturating_add(n as u64);
+            ensure!(received <= request.limit, Failure::Size);
+            ensure!(request.bytes.is_none_or(|b| received <= b), Failure::Size);
+            writer.write_all(&buffer[..n])?;
+            status.completed = received;
+            if let Some(total) = expected {
+                status.total = total;
+            }
+            let elapsed = window.0.elapsed();
+            if elapsed >= Duration::from_millis(500) {
+                status.bytes_per_second =
+                    (received.saturating_sub(window.1) as f64 / elapsed.as_secs_f64()) as u64;
+                window = (Instant::now(), received);
+                progress(status.clone());
+            }
+            // Mirror the aria2 path's stall detection instead of hanging on a
+            // source that trickles below a usable rate.
+            if !request.metadata && elapsed >= Duration::from_secs(30) {
+                let got = received.saturating_sub(window.1);
+                if status.completed < status.total
+                    && got as f64 / elapsed.as_secs_f64() < 256. * 1024.
+                {
+                    return Err(Failure::Stalled.into());
+                }
+            }
+        }
+        writer.flush()?;
+    }
+    stage.as_file().sync_all()?;
+    check_cancel(cancel)?;
     status.phase = Phase::Verifying;
     status.bytes_per_second = 0;
     progress(status.clone());
-    verify_file(path, request)?;
-    check_cancel(cancel)?;
-    status.completed = fs::metadata(path)?.len();
+    let staged = core::no_links(stage.path())?;
+    verify_file(&staged, request)?;
+    let target = core::no_links(path)?;
+    stage
+        .persist_noclobber(&target)
+        .map_err(|_| anyhow::anyhow!("无法写入下载文件：{}", target.display()))?;
+    status.completed = fs::metadata(&target)?.len();
     status.total = status.completed;
     status.phase = Phase::Complete;
-    progress(status);
+    progress(status.clone());
     Ok(())
 }
 

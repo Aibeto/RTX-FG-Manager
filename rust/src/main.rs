@@ -1,5 +1,11 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The GUI subsystem flag only applies when linking a Windows binary.
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 mod controller;
+#[cfg(windows)]
+#[path = "game_icons.rs"]
+mod game_icons;
+#[cfg(not(windows))]
+#[path = "game_icons_linux.rs"]
 mod game_icons;
 mod ui;
 mod ui_assets;

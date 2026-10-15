@@ -1,14 +1,15 @@
 pub const PUBLISHER: &str = "BF4DED3827EB26116EAE9E9ACACE0B0791D502BF";
+use crate::platform::CommandExt;
 use crate::{core, win};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 use std::{
     fs,
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
 };
 pub const REPO: &str = "pandaligx/RTX-FG-Manager";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -536,101 +537,113 @@ pub fn signal_ready(data: &Path) -> Result<()> {
         &serde_json::json!({"pid":std::process::id(),"sha256":ticket.manifest.sha256}),
     )
 }
-pub fn apply(ticket: &Path) -> Result<()> {
-    let _cache_lock = crate::cache::operation_lock()?;
-    let ticket = core::no_links(ticket)?;
-    ensure!(
-        ticket.file_name().is_some_and(|s| s == "install.json"),
-        "更新安装记录无效"
+pub fn apply(#[cfg_attr(not(windows), allow(unused_variables))] ticket: &Path) -> Result<()> {
+    // Windows replaces RTXManager.exe in place. A Linux AppImage is a single
+    // read-only squashfs image mounted by the kernel, so the running file cannot
+    // be overwritten — the user replaces the .AppImage itself. Reporting this
+    // explicitly is better than a confusing permission error mid-write.
+    #[cfg(not(windows))]
+    anyhow::bail!(
+        "Linux 版以 AppImage 分发：程序文件是只读的压缩镜像，无法自我替换。请从发布页下载新的 AppImage 覆盖旧文件。"
     );
-    let t: Ticket = serde_json::from_value(core::read_json(&ticket, 16384)?)?;
-    ensure!(
-        t.schema == 1
-            && t.parent > 0
-            && t.parent != std::process::id()
-            && core::valid_hash(&t.old_sha256),
-        "更新安装记录无效"
-    );
-    let folder = ticket.parent().context("无效路径")?;
-    let token = folder.file_name().context("无效路径")?.to_string_lossy();
-    ensure!(
-        token.len() == 32
-            && token.bytes().all(|c| c.is_ascii_hexdigit())
-            && folder == core::no_links(&t.data_dir.join("updates").join(token.as_ref()))?,
-        "更新暂存路径无效"
-    );
-    t.manifest.validate(crate::VERSION)?;
-    let source = core::no_links(&std::env::current_exe()?)?;
-    ensure!(source == folder.join(&t.manifest.file), "更新程序路径无效");
-    verify(&source, &t.manifest)?;
-    let target = core::no_links(&t.target)?;
-    ensure!(
-        target
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("exe"))
-            && version(&win::verify_signature(&target)?.version)? < version(crate::VERSION)?,
-        "更新目标无效"
-    );
-    win::wait_process(t.parent, 120000)?;
-    ensure!(
-        core::digest(&target)? == t.old_sha256,
-        "更新目标已变化，已停止替换"
-    );
-    let name = target.file_name().context("无效路径")?.to_string_lossy();
-    let destination = target.with_file_name(&t.manifest.file);
-    let stage = target.with_file_name(format!("{name}.{token}.new"));
-    let backup = target.with_file_name(format!("{name}.{token}.previous"));
-    ensure!(!stage.exists() && !backup.exists(), "更新备份路径冲突");
-    let mut src = fs::File::open(&source)?;
-    let mut dst = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&stage)?;
-    std::io::copy(&mut src, &mut dst)?;
-    dst.sync_all()?;
-    drop(dst);
-    verify(&stage, &t.manifest)?;
-    replace_named_and_launch(
-        &target,
-        &destination,
-        &stage,
-        &backup,
-        &t.old_sha256,
-        || {
-            let mut child = Command::new(&destination)
-                .args(["--data-dir".as_ref(), t.data_dir.as_os_str()])
-                .env("RTXFG_UPDATE_READY", token.as_ref())
-                .current_dir(destination.parent().context("无效路径")?)
-                .creation_flags(0x08000000)
-                .spawn()?;
-            let start = Instant::now();
-            loop {
-                if let Ok(ready) = core::read_json(&folder.join("ready.json"), 1024)
-                    && ready["pid"] == child.id()
-                    && ready["sha256"] == t.manifest.sha256
-                {
-                    return Ok(());
+    #[cfg(windows)]
+    {
+        let _cache_lock = crate::cache::operation_lock()?;
+        let ticket = core::no_links(ticket)?;
+        ensure!(
+            ticket.file_name().is_some_and(|s| s == "install.json"),
+            "更新安装记录无效"
+        );
+        let t: Ticket = serde_json::from_value(core::read_json(&ticket, 16384)?)?;
+        ensure!(
+            t.schema == 1
+                && t.parent > 0
+                && t.parent != std::process::id()
+                && core::valid_hash(&t.old_sha256),
+            "更新安装记录无效"
+        );
+        let folder = ticket.parent().context("无效路径")?;
+        let token = folder.file_name().context("无效路径")?.to_string_lossy();
+        ensure!(
+            token.len() == 32
+                && token.bytes().all(|c| c.is_ascii_hexdigit())
+                && folder == core::no_links(&t.data_dir.join("updates").join(token.as_ref()))?,
+            "更新暂存路径无效"
+        );
+        t.manifest.validate(crate::VERSION)?;
+        let source = core::no_links(&std::env::current_exe()?)?;
+        ensure!(source == folder.join(&t.manifest.file), "更新程序路径无效");
+        verify(&source, &t.manifest)?;
+        let target = core::no_links(&t.target)?;
+        ensure!(
+            target
+                .extension()
+                .is_some_and(|s| s.eq_ignore_ascii_case("exe"))
+                && version(&win::verify_signature(&target)?.version)? < version(crate::VERSION)?,
+            "更新目标无效"
+        );
+        win::wait_process(t.parent, 120000)?;
+        ensure!(
+            core::digest(&target)? == t.old_sha256,
+            "更新目标已变化，已停止替换"
+        );
+        let name = target.file_name().context("无效路径")?.to_string_lossy();
+        let destination = target.with_file_name(&t.manifest.file);
+        let stage = target.with_file_name(format!("{name}.{token}.new"));
+        let backup = target.with_file_name(format!("{name}.{token}.previous"));
+        ensure!(!stage.exists() && !backup.exists(), "更新备份路径冲突");
+        let mut src = fs::File::open(&source)?;
+        let mut dst = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&stage)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()?;
+        drop(dst);
+        verify(&stage, &t.manifest)?;
+        replace_named_and_launch(
+            &target,
+            &destination,
+            &stage,
+            &backup,
+            &t.old_sha256,
+            || {
+                let mut child = Command::new(&destination)
+                    .args(["--data-dir".as_ref(), t.data_dir.as_os_str()])
+                    .env("RTXFG_UPDATE_READY", token.as_ref())
+                    .current_dir(destination.parent().context("无效路径")?)
+                    .creation_flags(0x08000000)
+                    .spawn()?;
+                let start = Instant::now();
+                loop {
+                    if let Ok(ready) = core::read_json(&folder.join("ready.json"), 1024)
+                        && ready["pid"] == child.id()
+                        && ready["sha256"] == t.manifest.sha256
+                    {
+                        return Ok(());
+                    }
+                    if let Some(status) = child.try_wait()? {
+                        bail!("新版未能启动：{status}");
+                    }
+                    if start.elapsed() > Duration::from_secs(60) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!("新版启动超时，已恢复旧版");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                if let Some(status) = child.try_wait()? {
-                    bail!("新版未能启动：{status}");
-                }
-                if start.elapsed() > Duration::from_secs(60) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("新版启动超时，已恢复旧版");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        },
-    )?;
-    core::atomic_json(
-        &folder.join("installed.json"),
-        &serde_json::json!({"version":crate::VERSION,"backup":backup,"target":destination,"previous_target":target}),
-    )
+            },
+        )?;
+        core::atomic_json(
+            &folder.join("installed.json"),
+            &serde_json::json!({"version":crate::VERSION,"backup":backup,"target":destination,"previous_target":target}),
+        )
+    }
 }
 
 #[cfg(test)]
 mod download_tests {
+    #![cfg(windows)]
     use super::*;
     use crate::transfer::Readout;
     use std::io::Write;

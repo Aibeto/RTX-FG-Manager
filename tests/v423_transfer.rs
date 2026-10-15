@@ -240,3 +240,48 @@ fn invalid_default_or_index_is_not_silently_accepted() -> Result<()> {
     );
     Ok(())
 }
+
+/// Linux has no embedded downloader, and requiring a system `aria2c` would make
+/// downloads impossible on machines without it. `transfer::download` must
+/// therefore not depend on any external binary. This asserts the failure is a
+/// network/URL error rather than "tool not found", which is what a hidden
+/// dependency on aria2 would produce.
+#[cfg(not(windows))]
+#[test]
+fn linux_download_does_not_require_an_external_downloader() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let request = crate_request();
+    let error = transfer::download(
+        &request,
+        &temp.path().join("missing.zip"),
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .expect_err("download must fail against an unreachable host");
+    let text = format!("{error:#}").to_lowercase();
+    assert!(
+        !text.contains("aria2"),
+        "download must not depend on aria2: {text}"
+    );
+    assert!(
+        !text.contains("未找到") && !text.contains("no such file"),
+        "failure must be a network error, not a missing executable: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn crate_request() -> transfer::Request {
+    transfer::Request {
+        sources: vec![transfer::Source {
+            name: "github".into(),
+            // Reserved for documentation (RFC 2606); guaranteed unroutable.
+            url: "https://example.invalid/RTXManager-v4.2.9-x64.zip".into(),
+        }],
+        bytes: Some(32 * 1024 * 1024),
+        sha256: Some("a".repeat(64)),
+        limit: 64 * 1024 * 1024,
+        metadata: false,
+        policy: transfer::UrlPolicy::Official,
+    }
+}

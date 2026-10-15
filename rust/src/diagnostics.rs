@@ -1,17 +1,20 @@
 //! Per-game configuration edits and bounded, local-only diagnostic exports.
+#[cfg(windows)]
+use crate::platform::CommandExt;
 use crate::{cleanup, core, selftest, win};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
 };
 #[derive(Clone, Copy)]
 pub enum Encoding {
@@ -317,6 +320,15 @@ pub fn matching_events(xml: &str, exe: &Path) -> Vec<String> {
         .map(|m| m.as_str().to_string())
         .collect()
 }
+/// The Windows Error Reporting application log is a Win32 service. A Wine
+/// prefix has no equivalent, so the Linux build reports that explicitly and the
+/// exporter records it as a note instead of fabricating an empty event list.
+#[cfg(not(windows))]
+fn events(exe: &Path, cancel: &AtomicBool) -> Result<Vec<String>> {
+    let _ = (exe, cancel);
+    anyhow::bail!("Windows 错误事件日志在 Linux 版不可用；已跳过应用事件采集")
+}
+#[cfg(windows)]
 fn events(exe: &Path, cancel: &AtomicBool) -> Result<Vec<String>> {
     let temp = tempfile::tempfile()?;
     let reader = temp.try_clone()?;
